@@ -136,9 +136,9 @@ Run `scripts/fetch_related.py` with the paper's DOI or title+keywords. Returns:
 - 3–5 papers that contradict or challenge it
 - Ranked by citation count x recency score
 
-Sources queried in order: Semantic Scholar API -> arXiv -> scihub.org
+Sources queried in order: Semantic Scholar API -> arXiv
 
-### `/paper-graph [--depth N]`
+### `/paper-graph [--depth N] [--full-text-threshold T]`
 Recursive citation-graph traversal, building a persistent knowledge base rooted at the current
 paper (or `--slug` session's DOI). Run `scripts/paper_graph.py --slug [session-slug] --depth N`
 (default depth 2). Follows both directions — references (backward, primary-source backbone) and
@@ -146,9 +146,27 @@ citations (forward, situational context, including likely rebuttals via a `resul
 bypass) — ordered by relevance to the seed via a blended SPECTER2 + nomic-embed score, not plain
 breadth/depth-first order. Stores every paper found in the shared `paper-knowledge` ChromaDB
 collection (`~/.claude/chroma`), deduplicated across all past investigations, not just within one
-run. If the traversal's cost ceiling is reached before it naturally runs out of relevant papers to
-find, it pauses and asks whether to keep going rather than silently stopping.
-Design record: `~/.agents/docs/adr/0007`–`0011`.
+run. Already-known papers are skipped entirely during traversal: no S2 fetch, no embedding, no
+queue expansion — they're treated as dead ends for this run. If the traversal's cost ceiling is
+reached before it naturally runs out of relevant papers to find, it pauses and asks whether to
+keep going rather than silently stopping.
+
+**Full-text fetch for high-relevance nodes:** For nodes scoring ≥ `--full-text-threshold`
+(default 0.85, stricter than the inclusion floor of 0.65) that have arXiv IDs, paper-graph
+automatically fetches the full PDF from arXiv and extracts text via the same pipeline as
+ingest_paper.py, storing full text instead of abstract only. Nodes with arXiv IDs below the
+threshold remain abstract-only — no fetch is attempted. DOI-only papers (no arXiv ID) store their
+abstract regardless of score. Fetch failures (404, network error) gracefully degrade to
+abstract-only storage.
+
+Design records: `~/.agents/docs/adr/0007`–`0011`, `~/.agents/docs/adr/0031`.
+
+**Known gotcha**: the blended SPECTER2 + nomic-embed score ranks by semantic similarity, not
+domain correctness — it will occasionally surface a paper from a completely unrelated field (e.g.
+a medicine-journal DOI turning up in an LLM-security graph) because the embedding happened to land
+close. Treat any result from a visibly different field than the seed paper as a probable
+false positive and flag it for manual verification before citing, rather than trusting the score
+ranking alone. (Observed 2026-07-22 via `build_bibliography.py`, which shares this scoring path.)
 
 ### `/challenge`
 Switch to stress-test mode. The skill actively finds holes:
@@ -174,6 +192,16 @@ List recent paper sessions from `~/.claude/paper-sessions/`. Load a session and 
 ### `/synthesize`
 At L5 or after `/compare`, run the synthesis step: given everything learned, what new hypothesis emerges? What experiment would test it? Write to `~/.claude/paper-sessions/[slug]/synthesis.md`.
 
+### `/continuity-check`
+Examines whether later papers actually build on or engage with a seed paper, or whether they contradict it or have gaps in the logical chain. Run `scripts/continuity_checker.py --seeds-json <file> --out-json <file> --out-markdown <file>`, where seeds-json is `{slug: title, ...}`. Returns a report listing each seed's citers, classified as CONSISTENT (engages with the claim), GAP (claims to build on it but doesn't engage), or CONTRADICTS (opposes without acknowledgment). Papers flagged ⚠️ warrant deliberate review.
+
+**Known gotcha**: classification is based on core-claim comparison alone (qwen2.5:14b), unvalidated on real abstracts. False positives may arise from over-aggressive or under-aggressive claim extraction — treat surprising classifications as potential extraction artifacts and verify manually against the actual abstracts before trusting the verdict.
+
+### `/compare-hypothesis`
+Surfaces papers that support or refute a given hypothesis, revealing disagreement patterns in the literature. Run `scripts/competing_ideas.py --hypothesis "<claim>" --out-json <file> --out-markdown <file>`. Returns papers grouped as supporting, refuting, or mixed evidence. The interesting case is when both supports and refutes are non-empty — that's evidence of active field disagreement. Empty results (all support or all refute) are valid; they just indicate consensus in the collection, not a system error.
+
+**Known gotcha**: retrieval relies on semantic search (ChromaDB's default embedder), which surfaces papers by embedding similarity, not domain correctness. The same gotcha as `/paper-graph`'s SPECTER2+nomic-embed scoring — unrelated-field papers can appear if the embedding happens to land close. Treat results from visibly different fields as probable false positives; verify manually before citing.
+
 ---
 
 ## Session State
@@ -193,8 +221,7 @@ synthesis.md    -- output of /synthesize (if run)
 ## Source Hierarchy for Related Papers
 
 1. **Semantic Scholar API** (`api.semanticscholar.org`) -- free, no key required for basic use. Best for citation graph traversal. Use `scripts/fetch_related.py`.
-2. **arXiv** (`arxiv.org`) -- preprints. CS, math, physics, ML. Free API.
-3. **Science Hub** (`scihub.org`) -- Giles' preferred source for journal-quality papers. High-quality open-access journals with society partners.
+2. **arXiv** (`arxiv.org`) -- preprints. CS, math, physics, ML. Free API. Full-text PDFs available via `/paper-graph` for high-relevance nodes.
 
 Always surface which source each paper came from. Note open-access status.
 
